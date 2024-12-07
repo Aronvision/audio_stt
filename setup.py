@@ -17,7 +17,13 @@ setup(
     ],
     install_requires=[
         'setuptools',
-        # 필요한 의존성 패키지들을 나열합니다.
+        'numpy',
+        'SpeechRecognition',
+        'webrtcvad',
+        'faster-whisper',
+        'openai',
+        'gTTS',
+        'rclpy',
     ],
     zip_safe=True,
     maintainer='Your Name',
