@@ -12,6 +12,10 @@ from gtts import gTTS
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+import cv2
+import ast  # 문자열로 된 딕셔너리를 파싱하기 위해 추가
 
 class Audio_record:
     def __init__(self):
@@ -85,7 +89,7 @@ class Custom_faster_whisper:
         model_list = ['tiny', 'tiny.en', 'base', 'base.en', 'small', 'small.en', 'medium', 'medium.en', 'large-v1', 'large-v2', 'large-v3', 'large']
         if model_name not in model_list:
             model_name = 'tiny'
-            print('모델 이름 잘못됨. base로 설정. 아래 모델 중 한가지 선택')
+            print('모델 이름 잘못됨. base로 설정. ���래 모델 중 한가지 선택')
             print(model_list)
         self.model = WhisperModel(model_name, device="cpu", compute_type="int8")
         return model_name
@@ -138,6 +142,21 @@ class AudioSTTNode(Node):
         super().__init__('audio_stt_node')
         self.location_pub = self.create_publisher(String, 'target_location', 10)
         
+        # 새로운 subscriber 추가
+        self.detection_sub = self.create_subscription(
+            String,
+            'human_detection_results',
+            self.detection_callback,
+            10
+        )
+        self.image_sub = self.create_subscription(
+            Image,
+            'annotated_frame',
+            self.image_callback,
+            10
+        )
+        self.bridge = CvBridge()
+        
         # 기존 객체들 초기화
         self.audio_recorder = Audio_record()
         self.whisper = Custom_faster_whisper()
@@ -152,7 +171,7 @@ class AudioSTTNode(Node):
             "길 안내 질문의 경우, 응급실, 수납 및 접수 장소, 편의점, 화장실로의 안내만 가능합니다. "
             "다른 장소에 대한 길 안내 요청에는 '서비스를 준비중입니다'라고 답변하세요."
         )
-        self.target_locations = ['응급실', '수납', '접수', '편의점', '화장실']
+        self.target_locations = ['응급��', '수납', '접수', '편의점', '화장실']
         self.location_mapping = {
             '응급실': '0',
             '수납': '1',
@@ -161,74 +180,135 @@ class AudioSTTNode(Node):
             '화장실': '3'
         }
         
+        # 바운딩 박스 추적을 위한 변수들
+        self.last_center = None
+        self.stable_start_time = None
+        self.is_person_stable = False
+        self.movement_threshold = 50  # 픽셀 단위의 움직임 임계값
+        self.stable_threshold = 3.0   # 안정화 시간 임계값 (초)
+        
+        # STT 상태 관리
+        self.is_stt_running = False
+
+    def calculate_center(self, bbox):
+        # [xmin, ymin, xmax, ymax] 형식의 바운딩 박스에서 중앙값 계산
+        x_center = (bbox[0] + bbox[2]) / 2
+        y_center = (bbox[1] + bbox[3]) / 2
+        return (x_center, y_center)
+
+    def is_stable_position(self, current_center):
+        if self.last_center is None:
+            self.last_center = current_center
+            self.stable_start_time = time.time()
+            return False
+
+        # 이전 중앙값과 현재 중앙값의 거리 계산
+        distance = np.sqrt((current_center[0] - self.last_center[0])**2 + 
+                         (current_center[1] - self.last_center[1])**2)
+
+        if distance > self.movement_threshold:
+            # 움직임이 임계값을 초과하면 타이머 재설정
+            self.stable_start_time = time.time()
+            self.last_center = current_center
+            return False
+
+        # 안정화 시간 체크
+        stable_duration = time.time() - self.stable_start_time
+        self.last_center = current_center
+        return stable_duration >= self.stable_threshold
+
     def publish_location(self, location):
         msg = String()
         msg.data = self.location_mapping.get(location, '0')
         self.location_pub.publish(msg)
         self.get_logger().info(f'Published location: {msg.data}')
 
-def main(args=None):
-    rclpy.init(args=args)
-    node = AudioSTTNode()
-    
-    while rclpy.ok():
+    def detection_callback(self, msg):
+        # 문자열을 딕셔너리로 변환
+        self.get_logger().info("Received message on 'human_detection_results' topic")
+        detection_data = ast.literal_eval(msg.data)
+        
+        if detection_data["detected"] and not self.is_stt_running:
+            # 첫 번째 감지된 사람의 바운딩 박스 사용
+            bbox = detection_data["bounding_boxes"][0]
+            current_center = self.calculate_center(bbox)
+            
+            if self.is_stable_position(current_center):
+                if not self.is_person_stable:
+                    self.is_person_stable = True
+                    # STT 프로세스 시작
+                    self.start_stt_process()
+            else:
+                self.is_person_stable = False
+
+    def start_stt_process(self):
+        self.is_stt_running = True
+        self.get_logger().info("사람이 안정적으로 감지되어 음성 인식을 시작합니다...")
+        
+        # 음성 인식 프로세스
         print("말씀하세요... (Enter 입력하면 음성인식 종료)")
-        node.audio_recorder.record_start()
+        self.audio_recorder.record_start()
         try:
             input("녹음을 멈추려면 Enter를 누르세요...")
         except KeyboardInterrupt:
-            break
-        audio_result = node.audio_recorder.record_stop()
-
+            pass
+        
+        audio_result = self.audio_recorder.record_stop()
         print("음성을 텍스트로 변환 중...")
-        _, result_text, spent_time = node.whisper.run(audio_result['audio'], language='ko')
-        print(f"STT 결과: {result_text}, 시간: {spent_time}초")
-
-        # ChatGPT 요청
+        _, result_text, spent_time = self.whisper.run(audio_result['audio'], language='ko')
+        
+        # ChatGPT 요청 및 응답 처리
         try:
             response = openai.ChatCompletion.create(
                 model='gpt-3.5-turbo',
                 messages=[
-                    {'role': 'system', 'content': node.system_message},
+                    {'role': 'system', 'content': self.system_message},
                     {'role': 'user', 'content': result_text}
                 ]
             )
             chatgpt_reply = response['choices'][0]['message']['content'].strip()
-            print(f'ChatGPT 응답: {chatgpt_reply}')
-        except Exception as e:
-            print(f'OpenAI API 요청 중 오류 발생: {e}')
-            continue
-
-        # TTS로 ChatGPT 응답 재생
-        output_path = node.tts.make_speech(chatgpt_reply)
-        if output_path:
-            print('TTS 변환 완료')
-            os.system(f'play {output_path}')
-
-        # 장소 탐색 및 publish
-        matched_location = None
-        for location in node.target_locations:
-            if location in result_text:
-                matched_location = location
-                break
-
-        if matched_location:
-            # 길 안내 메시지 TTS
-            guidance_message = f'{matched_location}로 안내를 시작합니다.'
-            output_path = node.tts.make_speech(guidance_message)
+            
+            # TTS 변환 및 재생
+            output_path = self.tts.make_speech(chatgpt_reply)
             if output_path:
-                print('길 안내 TTS 변환 완료')
                 os.system(f'play {output_path}')
             
-            # ROS 토픽으로 위치 정보 publish
-            node.publish_location(matched_location)
+            # 위치 정보 처리
+            for location in self.target_locations:
+                if location in result_text:
+                    guidance_message = f'{location}로 안내를 시작합니다.'
+                    output_path = self.tts.make_speech(guidance_message)
+                    if output_path:
+                        os.system(f'play {output_path}')
+                    self.publish_location(location)
+                    break
+                    
+        except Exception as e:
+            self.get_logger().error(f'처리 중 오류 발생: {str(e)}')
+        
+        self.is_stt_running = False
 
-        cont = input("계속하시겠습니까? (y/n): ")
-        if cont.lower() != 'y':
-            break
+    def image_callback(self, msg):
+        self.get_logger().info("Received message on 'annotated_frame' topic")
+        try:
+            # ROS Image 메시지를 OpenCV 이미지로 변환
+            cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
+            # 이미지 표시 (선택사항)
+            cv2.imshow("Human Detection", cv_image)
+            cv2.waitKey(1)
+        except Exception as e:
+            self.get_logger().error(f'이미지 처리 중 에러 발생: {str(e)}')
 
-    node.destroy_node()
-    rclpy.shutdown()
+def main(args=None):
+    rclpy.init(args=args)
+    node = AudioSTTNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
