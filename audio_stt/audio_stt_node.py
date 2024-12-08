@@ -224,22 +224,25 @@ class AudioSTTNode(Node):
         self.get_logger().info(f'Published location: {msg.data}')
 
     def detection_callback(self, msg):
-        # 문자열을 딕셔너리로 변환
-        self.get_logger().info("Received message on 'human_detection_results' topic")
-        detection_data = ast.literal_eval(msg.data)
-        
-        if detection_data["detected"] and not self.is_stt_running:
-            # 첫 번째 감지된 사람의 바운딩 박스 사용
-            bbox = detection_data["bounding_boxes"][0]
-            current_center = self.calculate_center(bbox)
+        try:
+            # 문자열을 딕셔너리로 변환
+            self.get_logger().info("Received message on 'human_detection_results' topic")
+            detection_data = ast.literal_eval(msg.data)
             
-            if self.is_stable_position(current_center):
-                if not self.is_person_stable:
-                    self.is_person_stable = True
-                    # STT 프로세스 시작
-                    self.start_stt_process()
-            else:
-                self.is_person_stable = False
+            if detection_data["detected"] and not self.is_stt_running and detection_data["bounding_boxes"]:
+                # 첫 번째 감지된 사람의 바운딩 박스 사용
+                bbox = detection_data["bounding_boxes"][0]  # 이미 리스트 형태
+                current_center = self.calculate_center(bbox)
+                
+                if self.is_stable_position(current_center):
+                    if not self.is_person_stable:
+                        self.is_person_stable = True
+                        # STT 프로세스 시작
+                        self.start_stt_process()
+                else:
+                    self.is_person_stable = False
+        except Exception as e:
+            self.get_logger().error(f'Detection callback error: {str(e)}')
 
     def start_stt_process(self):
         self.is_stt_running = True
